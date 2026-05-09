@@ -555,6 +555,8 @@ class LoadCell:
         if (len(self._force_buffer_raw) > 0):
             res = round(avg(self._force_buffer_raw), 1)
         return res
+    def has_force_r(self):
+        return len(self._force_buffer_raw) > 0
     def clear_force_r(self):
         self._force_buffer_raw.clear()
 
@@ -625,6 +627,8 @@ class LoadCellEndstop:
         self.update_value_down = 0.
         self.update_value_up = 0.
         self.probing_sample_count = 0
+        self._home_start_time = 0.
+        self._last_home_trigger_time = 0.
         # self._gather = None
         self.pressure_change_value = config.getint(
             'pressure_change', 3000, minval=0
@@ -637,6 +641,28 @@ class LoadCellEndstop:
             'time_for_calm_down', default=1.0, minval=0.1)
         self.press_deformation_offset = config.getfloat(
             'press_deformation_offset', minval=0.
+        )
+        self.reuse_probe_thresholds = config.getboolean(
+            'reuse_probe_thresholds', False
+        )
+        self.no_trigger_retries = config.getint(
+            'no_trigger_retries', 1, minval=0, maxval=5
+        )
+        self.no_trigger_retract_dist = config.getfloat(
+            'no_trigger_retract_dist', 5.0, above=0.
+        )
+        self.minimum_probe_travel = config.getfloat(
+            'minimum_probe_travel', 2.0, minval=0.
+        )
+        self.no_trigger_retract_speed = config.getfloat(
+            'no_trigger_retract_speed',
+            config.getfloat('lift_speed', 5.0, above=0.), above=0.
+        )
+        self.force_sample_timeout = config.getfloat(
+            'force_sample_timeout', 1.0, above=0.
+        )
+        self.max_trigger_overshoot = config.getint(
+            'max_trigger_overshoot', 30000, minval=0
         )
         # self._printer.register_event_handler(
         #     "homing:home_rails_begin",
@@ -668,16 +694,19 @@ class LoadCellEndstop:
                    triggered=True):
         toolhead = self._printer.lookup_object("toolhead")
         self._trigger_time = 0.
+        self._home_start_time = print_time
         # 获取当前值
         trigger_completion = self._dispatch.start(print_time)
         range_min, range_max = self.load_cell.saturation_range()
-        # toolhead.wait_moves()
-        if self.probing_sample_count > 0:
+        toolhead.wait_moves()
+        if self.probing_sample_count > 0 and self.reuse_probe_thresholds:
             self._sensor_helper.setup_home(
                 self._dispatch.get_oid(),
                 self.reason_endstop_trigger, self.reason_endstop_error,
                 self.trigger_value_down, self.trigger_value_up)
             return trigger_completion
+        if not self.reuse_probe_thresholds:
+            self._reset_probe_thresholds()
         max_wait_num = 5 # 最少等待5轮
         min_calm_num = 3
         wait_num = 0
@@ -688,6 +717,10 @@ class LoadCellEndstop:
             min_calm_num = min(max_wait_num/4, int(0.5/wait_time))
         # reactor = self._printer.get_reactor()
 
+        # Start each probe from fresh raw samples. Reusing the previous contact
+        # window can shift the threshold enough to cause false or missed hits.
+        toolhead.dwell(max(0.1, wait_time * 2.0))
+        self._wait_for_force_sample(toolhead)
         # Reset the data before each detection?
         need_update_data = 1
         methods = 2
@@ -775,8 +808,9 @@ class LoadCellEndstop:
             trigger_value_down = self.trigger_value_down
             trigger_value_up = self.trigger_value_up
 
-        logging.info("home_start: cur:%d, wt:%.2f" %
-            (current_value, wait_time*(the_i+1)))
+        logging.info("home_start: cur:%d, down:%d, up:%d, wt:%.2f",
+                     current_value, trigger_value_down, trigger_value_up,
+                     wait_time*(the_i+1))
         self._sensor_helper.setup_home(
             self._dispatch.get_oid(),
             self.reason_endstop_trigger, self.reason_endstop_error,
@@ -790,7 +824,8 @@ class LoadCellEndstop:
     def home_wait(self, home_end_time):
         self._dispatch.wait_end(home_end_time)
         res = self._dispatch.stop()
-        trigger_time = self._sensor_helper.clear_home()
+        trigger_time = self._sensor_helper.clear_home(
+            stop=(res != self.reason_endstop_trigger))
         if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
             if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
                 raise self._printer.command_error(
@@ -800,21 +835,118 @@ class LoadCellEndstop:
             return 0.
         if self._mcu.is_fileoutput():
             return home_end_time
+        if self._is_stale_trigger_time(trigger_time, home_end_time):
+            return 0.
         self._trigger_time = trigger_time
+        self._last_home_trigger_time = trigger_time
         return trigger_time
         # return home_end_time
 
     def query_endstop(self, print_time):
         return False
+    def _is_stale_trigger_time(self, trigger_time, home_end_time):
+        state = getattr(self._sensor_helper, 'last_home_state', {})
+        trigger_clock = state.get('trigger_clock', 0)
+        trigger_data = state.get('trigger_data', 0)
+        duplicate = (self._last_home_trigger_time
+                     and abs(trigger_time - self._last_home_trigger_time)
+                     < 0.000001)
+        before_move = trigger_time <= self._home_start_time + 0.001
+        out_of_move = (trigger_time + 0.001 < self._home_start_time
+                       or trigger_time > home_end_time + 0.050)
+        missing = (not trigger_clock) or (not trigger_data)
+        overshoot = False
+        if self.max_trigger_overshoot and trigger_data:
+            overshoot = (trigger_data > (self.trigger_value_up
+                                         + self.max_trigger_overshoot)
+                         or trigger_data < (self.trigger_value_down
+                                            - self.max_trigger_overshoot))
+        if not (duplicate or before_move or out_of_move or missing
+                or overshoot):
+            return False
+        logging.warning("load_cell stale trigger ignored: start=%.6f "
+                        "end=%.6f trigger=%.6f clock=%s data=%s "
+                        "duplicate=%s before_move=%s out_of_move=%s "
+                        "missing=%s overshoot=%s window=%d~%d "
+                        "max_overshoot=%d",
+                        self._home_start_time, home_end_time, trigger_time,
+                        trigger_clock, trigger_data, duplicate, before_move,
+                        out_of_move, missing, overshoot,
+                        self.trigger_value_down, self.trigger_value_up,
+                        self.max_trigger_overshoot)
+        return True
+    def _reset_probe_thresholds(self):
+        self.trigger_value_down = 0.
+        self.trigger_value_up = 0.
+        self.update_value_down = 0.
+        self.update_value_up = 0.
+        self.load_cell.clear_force_r()
+    def _wait_for_force_sample(self, toolhead):
+        wait_time = max(self._sensor_helper.get_bulk_update(), 0.02)
+        sample_wait = 0.
+        while sample_wait < self.force_sample_timeout:
+            if self.load_cell.has_force_r():
+                return
+            toolhead.dwell(wait_time)
+            sample_wait += wait_time
+        raise self._printer.command_error(
+            "Load_Cell: No samples after clearing force buffer")
+    def _ensure_probe_travel(self, target_pos):
+        if self.minimum_probe_travel <= 0.:
+            return
+        toolhead = self._printer.lookup_object("toolhead")
+        curpos = toolhead.get_position()
+        available_travel = curpos[2] - target_pos[2]
+        if available_travel >= self.minimum_probe_travel:
+            return
+        lift_z = target_pos[2] + self.minimum_probe_travel
+        logging.info("load_cell probe pre-lift: cur_z=%.4f target_z=%.4f "
+                     "lift_z=%.4f",
+                     curpos[2], target_pos[2], lift_z)
+        toolhead.manual_move([None, None, lift_z],
+                             self.no_trigger_retract_speed)
+        toolhead.wait_moves()
+    def _recover_no_trigger(self, target_pos, start_z, attempt):
+        toolhead = self._printer.lookup_object("toolhead")
+        curpos = toolhead.get_position()
+        lift_z = max(curpos[2] + self.no_trigger_retract_dist, start_z,
+                     target_pos[2] + self.minimum_probe_travel)
+        logging.info("load_cell no-trigger retry %d/%d: cur_z=%.4f "
+                     "target_z=%.4f lift_z=%.4f",
+                     attempt, self.no_trigger_retries, curpos[2],
+                     target_pos[2], lift_z)
+        toolhead.manual_move([None, None, lift_z],
+                             self.no_trigger_retract_speed)
+        toolhead.wait_moves()
+        self._reset_probe_thresholds()
+        toolhead.dwell(max(0.2, self._sensor_helper.get_bulk_update() * 4.))
+        self._wait_for_force_sample(toolhead)
+    def _run_probing_move(self, pos, speed, count):
+        self.probing_sample_count = count
+        phoming = self._printer.lookup_object('homing')
+        toolhead = self._printer.lookup_object("toolhead")
+        self._ensure_probe_travel(pos)
+        start_z = toolhead.get_position()[2]
+        for attempt in range(self.no_trigger_retries + 1):
+            try:
+                epos = phoming.probing_move(self, pos, speed)
+                epos[2] += self.press_deformation_offset
+                return epos
+            except self._printer.command_error as e:
+                reason = str(e)
+                recoverable = (
+                    "No trigger on probe after full movement" in reason
+                    or "Probe triggered prior to movement" in reason
+                )
+                if (not recoverable or attempt >= self.no_trigger_retries):
+                    raise
+                self._recover_no_trigger(pos, start_z, attempt + 1)
+                start_z = toolhead.get_position()[2]
+        raise self._printer.command_error(
+            "No trigger on probe after full movement")
     # Interface for ProbeEndstopWrapper
     def probing_move(self, pos, speed):
-        # Perform probing move
-        self.probing_sample_count = 0
-        phoming = self._printer.lookup_object('homing')
-        epos = phoming.probing_move(self, pos, speed)
-        # Eliminate deformation caused by pressure
-        epos[2] += self.press_deformation_offset
-        return epos
+        return self._run_probing_move(pos, speed, 0)
         # trig_pos = phoming.probing_move(self, pos, speed)
         # if not self._trigger_time:
         #     return trig_pos
@@ -826,13 +958,7 @@ class LoadCellEndstop:
         # self._gather.note_probe(start_time, end_time, toolhead_pos)
         # return self._gather.pull_probed()[0]
     def probing_move_2(self, pos, speed, count):
-        # Perform probing move
-        self.probing_sample_count = count
-        phoming = self._printer.lookup_object('homing')
-        epos = phoming.probing_move(self, pos, speed)
-        # Eliminate deformation caused by pressure
-        epos[2] += self.press_deformation_offset
-        return epos
+        return self._run_probing_move(pos, speed, count)
     def multi_probe_begin(self):
         # self.load_cell._start_streaming()
         toolhead = self._printer.lookup_object("toolhead")
@@ -851,7 +977,8 @@ class LoadCellEndstop:
         # reactor = self._printer.get_reactor()
         toolhead.wait_moves()
         self.load_cell.clear_force_r() # 清除旧数据的干扰
-        toolhead.dwell(0.5)
+        toolhead.dwell(max(0.2, self._sensor_helper.get_bulk_update() * 4.))
+        self._wait_for_force_sample(toolhead)
         for the_i in range(max_wait_num):
             current_value = int(self.load_cell.get_force_r())
             # if (range_min < current_value) and (current_value < range_max):
@@ -884,7 +1011,10 @@ class LoadCellEndstop:
             toolhead.dwell(wait_time)
         if (wait_num < min_calm_num):
             raise self._printer.command_error(
-                "Load_Cell: The sensor can't calm down!"
+                "Load_Cell: The sensor can't calm down! cur:%d stable:%d/%d"
+                " window:%d~%d"
+                % (current_value, wait_num, min_calm_num,
+                   self.update_value_down, self.update_value_up)
             )
 
         if (current_value <= range_min) or (current_value >= range_max):

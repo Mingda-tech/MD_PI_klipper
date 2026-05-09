@@ -52,6 +52,7 @@ class DualNozzleHeightCalibration:
     def cmd_CALIBRATE_DUAL_NOZZLES(self, gcmd):
         try:
             self.logger.info("Starting dual nozzle calibration")
+            self.gcode.run_script_from_command("BED_MESH_CLEAR")
             # Ensure the printer is homed
             toolhead = self.printer.lookup_object('toolhead')
             if 'xyz' not in toolhead.get_status(self.printer.get_reactor().monotonic())['homed_axes']:
@@ -70,13 +71,9 @@ class DualNozzleHeightCalibration:
                 variables.get('zendstop', 0.)
             ]
             self.safe_z_height = variables.get('switch_zpos', 10.)
-            self.right_nozzle_x_offset = variables.get('e1_xoffset', 0.)
-            self.right_nozzle_y_offset = variables.get('e1_yoffset', 0.)
             
             self.logger.info(f"Using switch_position: {self.switch_position}")
             self.logger.info(f"Using safe_z_height: {self.safe_z_height}")
-            self.logger.info(f"Using right_nozzle_x_offset: {self.right_nozzle_x_offset}")
-            self.logger.info(f"Using right_nozzle_y_offset: {self.right_nozzle_y_offset}")
 
             # Measure height of first nozzle
             self.logger.info("Measuring height of first nozzle")
@@ -118,12 +115,8 @@ class DualNozzleHeightCalibration:
 
     def _move_to_safe_z(self, gcmd):
         self.logger.info(f"Moving to safe Z height: {self.safe_z_height}")
-        toolhead = self.printer.lookup_object('toolhead')
-        curpos = toolhead.get_position()
-        curpos[2] = self.safe_z_height
         try:
-            toolhead.move(curpos, self.lift_speed) 
-            toolhead.wait_moves()
+            self.gcode.run_script_from_command(f"G1 Z{self.safe_z_height} F{self.lift_speed * 60}\nM400")
         except self.printer.command_error as e:
             self.logger.error(f"Error moving to safe Z height: {str(e)}")
             raise gcmd.error(str(e))
@@ -134,7 +127,7 @@ class DualNozzleHeightCalibration:
         curtime = self.printer.get_reactor().monotonic()
         self.logger.info(f"Current toolhead position: {toolhead.get_position()}")
         self.logger.info(f"Homed axes: {toolhead.get_status(curtime)['homed_axes']}")
-        toolhead.wait_moves()
+        self.gcode.run_script_from_command("M400")
         
         # Move to safe Z height
         self._move_to_safe_z(gcmd)
@@ -142,17 +135,11 @@ class DualNozzleHeightCalibration:
         # Move to probing position XY
         probe_x = self.switch_position[0]
         probe_y = self.switch_position[1]
-        if is_right_nozzle:
-            probe_x += self.right_nozzle_x_offset
-            probe_y += self.right_nozzle_y_offset
+
         
         self.logger.info(f"Moving to probing position XY: {probe_x}, {probe_y}")
-        pos = toolhead.get_position()
-        pos[0] = probe_x
-        pos[1] = probe_y
         try:
-            toolhead.move(pos, self.speed)
-            toolhead.wait_moves()
+            self.gcode.run_script_from_command(f"G1 X{probe_x} Y{probe_y} F{self.speed * 60}\nM400")
         except self.printer.command_error as e:
             self.logger.error(f"Error moving to probing position XY: {str(e)}")
             raise gcmd.error(str(e))
@@ -208,12 +195,9 @@ class DualNozzleHeightCalibration:
 
     def _retract(self, pos):
         self.logger.info(f"Retracting by {self.sample_retract_dist}mm")
-        toolhead = self.printer.lookup_object('toolhead')
-        retract_pos = list(pos)
-        retract_pos[2] += self.sample_retract_dist
+        target_z = pos[2] + self.sample_retract_dist
         try:
-            toolhead.move(retract_pos, self.lift_speed)
-            toolhead.wait_moves()
+            self.gcode.run_script_from_command(f"G1 Z{target_z} F{self.lift_speed * 60}\nM400")
         except self.printer.command_error as e:
             self.logger.error(f"Error during retraction: {str(e)}")
             raise
