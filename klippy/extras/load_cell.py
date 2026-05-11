@@ -25,10 +25,13 @@ def avg(data):
 
 # Helper for event driven webhooks and subscription based API clients
 class ApiClientHelper(object):
-    def __init__(self, printer):
+    def __init__(self, printer, api_start_cb=None, api_stop_cb=None):
         self.printer = printer
         self.client_cbs = []
         self.webhooks_start_resp = {}
+        self.api_start_cb = api_start_cb
+        self.api_stop_cb = api_stop_cb
+        self.api_client_count = 0
 
     # send data to clients
     def send(self, msg):
@@ -45,7 +48,18 @@ class ApiClientHelper(object):
     # Add Webhooks client and send header
     def _add_webhooks_client(self, web_request):
         whbatch = BatchWebhooksClient(web_request)
-        self.add_client(whbatch.handle_batch)
+        if self.api_client_count == 0 and self.api_start_cb is not None:
+            self.api_start_cb()
+        self.api_client_count += 1
+        def handle_batch(msg):
+            res = whbatch.handle_batch(msg)
+            if not res:
+                self.api_client_count = max(0, self.api_client_count - 1)
+                if (self.api_client_count == 0
+                    and self.api_stop_cb is not None):
+                    self.api_stop_cb()
+            return res
+        self.add_client(handle_batch)
         web_request.send(self.webhooks_start_resp)
 
     # Set up a webhooks endpoint with a static header
@@ -120,9 +134,13 @@ class LoadCellCommandHelper:
         gcmd.respond_info("Collecting load cell data for 10 seconds...")
         collector = self.load_cell.get_collector()
         reactor = self.printer.get_reactor()
-        collector.start_collecting()
-        reactor.pause(reactor.monotonic() + 10.)
-        samples, errors = collector.stop_collecting()
+        self.load_cell._start_streaming("diagnostic")
+        try:
+            collector.start_collecting()
+            reactor.pause(reactor.monotonic() + 10.)
+            samples, errors = collector.stop_collecting()
+        finally:
+            self.load_cell._finish_streaming("diagnostic")
         if errors:
             gcmd.respond_info("Sensor reported errors: %i errors,"
                               " %i overflows" % (errors[0], errors[1]))
@@ -409,8 +427,13 @@ class LoadCell:
         self.global_detection = config.getboolean('global_detection', True)
         self.probe_session = probe.ProbeSessionHelper(config, self.mcu_probe)
         # Client support:
-        self.clients = ApiClientHelper(printer)
+        self.clients = ApiClientHelper(
+            printer, lambda: self._start_streaming("api"),
+            lambda: self._finish_streaming("api"))
         self._need_stop = True
+        self._stream_requests = set()
+        self._sensor_client_active = False
+        self._track_force_registered = False
         header = {"header": ["time", "force (g)", "counts", "tare_counts"]}
         self.clients.add_mux_endpoint("load_cell/dump_force",
                                       "load_cell", self.name, header)
@@ -421,7 +444,7 @@ class LoadCell:
         
     def _handle_ready(self):
         if self.global_detection:
-            self._start_streaming()
+            self._start_streaming("global")
         # announce calibration status on ready
         if self.is_calibrated():
             self.printer.send_event("load_cell:calibrate", self)
@@ -431,6 +454,7 @@ class LoadCell:
     # convert raw counts to grams and broadcast to clients
     def _add_measurement(self, msg):
         if self._need_stop:
+            self._sensor_client_active = False
             return False
         data = msg.get("data")
         errors = msg.get("errors")
@@ -446,20 +470,36 @@ class LoadCell:
         self.clients.send(msg)
         return True
     
-    def _start_streaming(self):
-        logging.info("load_cell _start_streaming")
-        if not self._need_stop:
+    def _start_streaming(self, reason="manual"):
+        logging.info("load_cell _start_streaming:%s", reason)
+        if reason in self._stream_requests:
+            return
+        was_requested = bool(self._stream_requests)
+        self._stream_requests.add(reason)
+        if was_requested:
             return
         self._need_stop = False
-        self.sensor.add_client(self._add_measurement)
-        self.add_client(self._track_force)
+        if not self._sensor_client_active:
+            self._sensor_client_active = True
+            self.sensor.add_client(self._add_measurement)
+        if not self._track_force_registered:
+            self.add_client(self._track_force)
+            self._track_force_registered = True
         logging.info("load_cell add_client")
         
-    def _finish_streaming(self):
-        logging.info("load_cell _stop_streaming")
+    def _finish_streaming(self, reason="manual"):
+        logging.info("load_cell _stop_streaming:%s", reason)
+        if reason not in self._stream_requests:
+            return
+        self._stream_requests.remove(reason)
+        if self._stream_requests:
+            return
         self._need_stop = True
         self._force_buffer.clear()
         self._force_buffer_raw.clear()
+
+    def is_streaming(self):
+        return bool(self._stream_requests)
 
     # get internal events of force data
     def add_client(self, callback):
@@ -502,11 +542,13 @@ class LoadCell:
     # read 1 second of load cell data and average it
     # performs safety checks for saturation
     def avg_counts(self, num_samples=None):
-        # self._start_streaming()
+        self._start_streaming("read")
         if num_samples is None:
             num_samples = self.sensor.get_samples_per_second()
-        samples, errors = self.get_collector().collect_min(num_samples)
-        # self._finish_streaming()
+        try:
+            samples, errors = self.get_collector().collect_min(num_samples)
+        finally:
+            self._finish_streaming("read")
         if errors:
             raise self.printer.command_error(
                 "Sensor reported %i errors while sampling"
@@ -920,30 +962,38 @@ class LoadCellEndstop:
         toolhead.wait_moves()
         self._reset_probe_thresholds()
         toolhead.dwell(max(0.2, self._sensor_helper.get_bulk_update() * 4.))
-        self._wait_for_force_sample(toolhead)
+        try:
+            self._wait_for_force_sample(toolhead)
+        except:
+            self.load_cell._finish_streaming("probe")
+            raise
     def _run_probing_move(self, pos, speed, count):
         self.probing_sample_count = count
         phoming = self._printer.lookup_object('homing')
         toolhead = self._printer.lookup_object("toolhead")
         self._ensure_probe_travel(pos)
         start_z = toolhead.get_position()[2]
-        for attempt in range(self.no_trigger_retries + 1):
-            try:
-                epos = phoming.probing_move(self, pos, speed)
-                epos[2] += self.press_deformation_offset
-                return epos
-            except self._printer.command_error as e:
-                reason = str(e)
-                recoverable = (
-                    "No trigger on probe after full movement" in reason
-                    or "Probe triggered prior to movement" in reason
-                )
-                if (not recoverable or attempt >= self.no_trigger_retries):
-                    raise
-                self._recover_no_trigger(pos, start_z, attempt + 1)
-                start_z = toolhead.get_position()[2]
-        raise self._printer.command_error(
-            "No trigger on probe after full movement")
+        self.load_cell._start_streaming("probe_move")
+        try:
+            for attempt in range(self.no_trigger_retries + 1):
+                try:
+                    epos = phoming.probing_move(self, pos, speed)
+                    epos[2] += self.press_deformation_offset
+                    return epos
+                except self._printer.command_error as e:
+                    reason = str(e)
+                    recoverable = (
+                        "No trigger on probe after full movement" in reason
+                        or "Probe triggered prior to movement" in reason
+                    )
+                    if (not recoverable or attempt >= self.no_trigger_retries):
+                        raise
+                    self._recover_no_trigger(pos, start_z, attempt + 1)
+                    start_z = toolhead.get_position()[2]
+            raise self._printer.command_error(
+                "No trigger on probe after full movement")
+        finally:
+            self.load_cell._finish_streaming("probe_move")
     # Interface for ProbeEndstopWrapper
     def probing_move(self, pos, speed):
         return self._run_probing_move(pos, speed, 0)
@@ -960,7 +1010,7 @@ class LoadCellEndstop:
     def probing_move_2(self, pos, speed, count):
         return self._run_probing_move(pos, speed, count)
     def multi_probe_begin(self):
-        # self.load_cell._start_streaming()
+        self.load_cell._start_streaming("probe")
         toolhead = self._printer.lookup_object("toolhead")
         self._trigger_time = 0.
         # 获取当前值
@@ -978,7 +1028,11 @@ class LoadCellEndstop:
         toolhead.wait_moves()
         self.load_cell.clear_force_r() # 清除旧数据的干扰
         toolhead.dwell(max(0.2, self._sensor_helper.get_bulk_update() * 4.))
-        self._wait_for_force_sample(toolhead)
+        try:
+            self._wait_for_force_sample(toolhead)
+        except:
+            self.load_cell._finish_streaming("probe")
+            raise
         for the_i in range(max_wait_num):
             current_value = int(self.load_cell.get_force_r())
             # if (range_min < current_value) and (current_value < range_max):
@@ -1010,6 +1064,7 @@ class LoadCellEndstop:
                 wait_num = 1
             toolhead.dwell(wait_time)
         if (wait_num < min_calm_num):
+            self.load_cell._finish_streaming("probe")
             raise self._printer.command_error(
                 "Load_Cell: The sensor can't calm down! cur:%d stable:%d/%d"
                 " window:%d~%d"
@@ -1018,6 +1073,7 @@ class LoadCellEndstop:
             )
 
         if (current_value <= range_min) or (current_value >= range_max):
+            self.load_cell._finish_streaming("probe")
             raise self._printer.command_error(
                 "Load_Cell: Invalid data has been detected: %d"
                 % (current_value,))
@@ -1033,7 +1089,7 @@ class LoadCellEndstop:
                      current_value, wait_time*(the_i+1), wait_num)
         return 0
     def multi_probe_end(self):
-        # self.load_cell._finish_streaming()
+        self.load_cell._finish_streaming("probe")
         logging.info("multi_pe")
         return 0
     def probe_prepare(self, hmove):

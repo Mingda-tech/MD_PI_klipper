@@ -236,11 +236,11 @@ class ManualStepper:
                     s.set_rotation_distance(rotation_dist)
                     s.set_dir_inverted(next_invert_dir)
             self.button_list['button1'].update({'state': state_name})
-            # if self.show_info:
-            #     gcmd = self.printer.lookup_object('gcode')
-            #     gcmd.respond_info(
-            #         "manual_stepper '%s' rotation_distance is %0.6f"
-            #         % (self.stepper_name, rotation_dist))
+            if self.show_info:
+                gcmd = self.printer.lookup_object('gcode')
+                gcmd.respond_info(
+                    "manual_stepper '%s' rotation_distance is %0.6f"
+                    % (self.stepper_name, rotation_dist))
     def button2_callback(self, eventtime, state):
         if self.funtion_button == 'set_rotation_distance':
             if state:
@@ -263,11 +263,11 @@ class ManualStepper:
                     s.set_rotation_distance(rotation_dist)
                     s.set_dir_inverted(next_invert_dir)
             self.button_list['button2'].update({'state': state_name})
-            # if self.show_info:
-            #     gcmd = self.printer.lookup_object('gcode')
-            #     gcmd.respond_info(
-            #         "manual_stepper '%s' rotation_distance is %0.6f"
-            #         % (self.stepper_name, rotation_dist))
+            if self.show_info:
+                gcmd = self.printer.lookup_object('gcode')
+                gcmd.respond_info(
+                    "manual_stepper '%s' rotation_distance is %0.6f"
+                    % (self.stepper_name, rotation_dist))
 
     #----------------------------------------------
     def sync_print_time(self):
