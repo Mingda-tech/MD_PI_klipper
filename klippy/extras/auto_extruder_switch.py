@@ -14,6 +14,8 @@ class AutoExtruderSwitch:
         self.auto_switch_enabled = False
         self.right_head_only = False  # 是否只使用右打印头
         self.left_head_only = False  # 是否只使用左打印头
+        self.park_x = config.getfloat('park_x', 0.)
+        self.park_y = config.getfloat('park_y', 0.)
         
         # 保存打印状态
         self.saved_state = {
@@ -47,11 +49,23 @@ class AutoExtruderSwitch:
         self.toolhead = self.printer.lookup_object('toolhead')
         self.pause_resume = self.printer.lookup_object('pause_resume')
         self.dual_carriage = self.printer.lookup_object('dual_carriage', None)
-        
+
         # 获取料丝传感器
         self.sensor0 = self.printer.lookup_object('filament_switch_sensor Filament_Sensor0', None)
         self.sensor1 = self.printer.lookup_object('filament_switch_sensor Filament_Sensor1', None)
-        
+
+        # 检测 AFS 送料系统是否存在
+        self.has_afs = self.printer.lookup_object(
+            'gcode_macro _FEED_SYS_DATA', None) is not None
+
+    def _set_afs_idle_flag(self, value):
+        """设置 AFS 送料系统的 idle_flag，防止竞态条件"""
+        if not self.has_afs:
+            return
+        self.gcode.run_script_from_command(
+            'SET_GCODE_VARIABLE MACRO="_FEED_SYS_DATA"'
+            ' VARIABLE="idle_flag" VALUE=%d' % value)
+
     def _save_current_state(self):
         """保存当前打印头的状态"""
         gcode_move = self.printer.lookup_object('gcode_move')
@@ -140,106 +154,166 @@ class AutoExtruderSwitch:
                 
     cmd_CHECK_AND_SWITCH_EXTRUDER_help = "检查并切换打印头（如果需要）"
     def cmd_CHECK_AND_SWITCH_EXTRUDER(self, gcmd):
+        # 检查是否正在打印
+        idle_timeout = self.printer.lookup_object("idle_timeout")
+        is_printing = idle_timeout.get_status(
+            self.reactor.monotonic())["state"] == "Printing"
+        if not is_printing:
+            self.gcode.run_script_from_command(
+                "M118 Not printing, ignoring filament runout")
+            return
+
         if not self.auto_switch_enabled:
-            self.gcode.run_script_from_command("M118 Filament run out, pausing print")
+            self.gcode.run_script_from_command(
+                "M118 Filament run out, pausing print")
             self.gcode.run_script_from_command("PAUSE")
             return
-            
+
         # 如果不是单头打印，不执行自动切换
         if not self._is_single_extruder_print():
-            self.gcode.run_script_from_command("M118 Not in single extruder mode, pausing print")
+            self.gcode.run_script_from_command(
+                "M118 Not in single extruder mode, pausing print")
             self.gcode.run_script_from_command("PAUSE")
             return
-            
+
         # Get current extruder and position
         cur_extruder = self.toolhead.get_extruder()
         cur_extruder_name = cur_extruder.get_name()
-        
+
         # 根据当前打印头选择对应的传感器
-        cur_sensor = self.sensor0 if cur_extruder_name == 'extruder' else self.sensor1
-        other_sensor = self.sensor1 if cur_extruder_name == 'extruder' else self.sensor0
-        other_extruder_name = 'extruder1' if cur_extruder_name == 'extruder' else 'extruder'
-        
+        cur_sensor = (self.sensor0 if cur_extruder_name == 'extruder'
+                      else self.sensor1)
+        other_sensor = (self.sensor1 if cur_extruder_name == 'extruder'
+                        else self.sensor0)
+        other_extruder_name = ('extruder1' if cur_extruder_name == 'extruder'
+                               else 'extruder')
+
         if cur_sensor is None:
-            self.gcode.run_script_from_command("M118 Current sensor not configured, pausing print")
+            self.gcode.run_script_from_command(
+                "M118 Current sensor not configured, pausing print")
             self.gcode.run_script_from_command("PAUSE")
             return
-            
+
         if other_sensor is None:
-            self.gcode.run_script_from_command("M118 Other sensor not configured, pausing print")
+            self.gcode.run_script_from_command(
+                "M118 Other sensor not configured, pausing print")
             self.gcode.run_script_from_command("PAUSE")
             return
-            
+
         # 获取传感器状态
         cur_status = cur_sensor.get_status(self.reactor.monotonic())
         other_status = other_sensor.get_status(self.reactor.monotonic())
-        
+
         if cur_status['filament_detected']:
-            self.gcode.run_script_from_command("M118 Current extruder has filament, continuing print")
+            self.gcode.run_script_from_command(
+                "M118 Current extruder has filament, continuing print")
             return
-            
+
         if not other_status['filament_detected']:
-            self.gcode.run_script_from_command("M118 Both extruders out of filament, pausing print")
+            self.gcode.run_script_from_command(
+                "M118 Both extruders out of filament, pausing print")
             self.gcode.run_script_from_command("PAUSE")
             return
-            
-        self.gcode.run_script_from_command("M118 Filament run out, switching extruder")
-        
+
+        self.gcode.run_script_from_command(
+            "M118 Filament run out, switching extruder")
+
         # 保存当前打印头状态
         self._save_current_state()
 
-        # 抬升Z轴2mm
-        self.gcode.run_script_from_command("G91")  # Relative positioning
-        self.gcode.run_script_from_command("G1 Z2 F600")
-        self.gcode.run_script_from_command("G90")  # Absolute positioning
-        
-        # 获取当前打印头的温度
+        # 暂停 SD 文件读取（不使用 PAUSE gcode，因为 RESUME 的
+        # RESTORE_GCODE_STATE 会撤销 T0/T1 的偏移量变更）
+        self.pause_resume.send_pause_command()
+
+        # 保存当前 gcode XY 坐标，用于切换后返回
+        gcode_move = self.printer.lookup_object('gcode_move')
+        saved_x = gcode_move.last_position[0]
+        saved_y = gcode_move.last_position[1]
+        # 保存 gcode Z 坐标（切片器坐标，不含 base_position）
+        # 切换后用绝对定位回到此 Z，自动适应 T0/T1 的偏移量变更
+        saved_gcode_z = (gcode_move.last_position[2]
+                         - gcode_move.base_position[2])
+
+        # 先读取温度，再关闭旧喷头（M104 不阻塞，发完即走）
         cur_heater = self.printer.lookup_object(cur_extruder_name)
         other_heater = self.printer.lookup_object(other_extruder_name)
         cur_temp = cur_heater.get_status(self.reactor.monotonic())['target']
         other_temp = other_heater.get_status(self.reactor.monotonic())['target']
-        
-        # 如果另一个打印头温度太低，先预热
-        if other_temp < cur_temp - 30:  # Allow 30 degree difference
-            if other_extruder_name == 'extruder':
-                self.gcode.run_script_from_command("M104 T0 S%.1f" % cur_temp)
-                self.gcode.run_script_from_command("M104 T1 S0")
-            else:
-                self.gcode.run_script_from_command("M104 T1 S%.1f" % cur_temp)
-                self.gcode.run_script_from_command("M104 T0 S0")
-            # Wait for heating
-            if other_extruder_name == 'extruder':
-                self.gcode.run_script_from_command("M109 T0 S%.1f" % cur_temp)
-            else:
-                self.gcode.run_script_from_command("M109 T1 S%.1f" % cur_temp)
-        
-      
-        # 切换打印头
-        if other_extruder_name == 'extruder':
-            # Switch to left extruder
-            self.gcode.run_script_from_command("M118 Switching to left extruder")
-            self.gcode.run_script_from_command("T0")  # Let T0 macro handle all offsets
+
+        # 关闭原喷头加热（不等待降温）
+        if cur_extruder_name == 'extruder':
+            self.gcode.run_script_from_command("M104 T0 S0")
         else:
-            # Switch to right extruder
-            self.gcode.run_script_from_command("M118 Switching to right extruder")
+            self.gcode.run_script_from_command("M104 T1 S0")
+
+        # 抬升 Z 轴（相对移动，不受 gcode offset 影响）
+        self.gcode.run_script_from_command("G91")
+        self.gcode.run_script_from_command("G1 Z5 F600")
+        self.gcode.run_script_from_command("G90")
+
+        # 移动到暂停位置，避免预热时耗材滴在模型上
+        self.gcode.run_script_from_command(
+            "G1 X%.3f Y%.3f F6000" % (self.park_x, self.park_y))
+
+        # 如果另一个打印头温度太低，先预热并等待到温
+        if other_temp < cur_temp - 30:
+            if other_extruder_name == 'extruder':
+                self.gcode.run_script_from_command(
+                    "M104 T0 S%.1f" % cur_temp)
+                self.gcode.run_script_from_command(
+                    "M109 T0 S%.1f" % cur_temp)
+            else:
+                self.gcode.run_script_from_command(
+                    "M104 T1 S%.1f" % cur_temp)
+                self.gcode.run_script_from_command(
+                    "M109 T1 S%.1f" % cur_temp)
+
+        # 切换打印头（T0/T1 宏自动处理 Z 偏移补偿）
+        if other_extruder_name == 'extruder':
+            self.gcode.run_script_from_command(
+                "M118 Switching to left extruder")
+            self.gcode.run_script_from_command("T0")
+        else:
+            self.gcode.run_script_from_command(
+                "M118 Switching to right extruder")
             self.gcode.run_script_from_command("T1")
-            
+
         # Wait a moment to ensure switch is complete
         self.toolhead.dwell(0.5)
-        
-        # Lower Z by 2mm
-        self.gcode.run_script_from_command("G91")  # Relative positioning
-        self.gcode.run_script_from_command("G1 Z-2 F600")
-        self.gcode.run_script_from_command("G90")  # Absolute positioning
-        
+
+        # 从暂停位置移回打印位置（XY 使用相对移动，不受 T0/T1 偏移量变更影响）
+        park_dx = saved_x - self.park_x
+        park_dy = saved_y - self.park_y
+        self.gcode.run_script_from_command("G91")
+        self.gcode.run_script_from_command(
+            "G1 X%.3f Y%.3f F6000" % (park_dx, park_dy))
+        self.gcode.run_script_from_command("G90")
+
+        # Z 回位使用绝对坐标，自动适应 T0/T1 的 SET_GCODE_OFFSET 偏移量变更
+        # G1 Z=saved_gcode_z → last_position = saved_gcode_z + new_base_position
+        # 无论 T0/T1 用 MOVE=1 还是 MOVE=0，最终物理 Z 都正确
+        self.gcode.run_script_from_command("G1 Z%.3f F600" % saved_gcode_z)
+
         # Sync extruder position
-        self.gcode.run_script_from_command("G92 E0")  # Reset extruder position
+        self.gcode.run_script_from_command("G92 E0")
 
         # Restore extruder state
         self._restore_state_to_extruder(other_extruder_name)
-        
-        # Show completion message
-        self.gcode.run_script_from_command("M118 Extruder switch complete, resuming print")
+
+        # Show completion message and resume print
+        self.gcode.run_script_from_command(
+            "M118 Extruder switch complete, resuming print")
+
+        # 恢复前禁用 AFS idle_flag，防止 AFS 送料传感器在恢复瞬间
+        # 检测到旧挤出头无料而再次触发 PAUSE
+        self._set_afs_idle_flag(0)
+
+        # 恢复 SD 文件读取，继续打印
+        self.pause_resume.send_resume_command()
+
+        # 等待恢复生效后重新启用 AFS
+        self.toolhead.dwell(0.5)
+        self._set_afs_idle_flag(1)
         
     cmd_ENABLE_AUTO_EXTRUDER_SWITCH_help = "Enable automatic extruder switching"
     def cmd_ENABLE_AUTO_EXTRUDER_SWITCH(self, gcmd):
