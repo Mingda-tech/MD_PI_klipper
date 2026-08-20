@@ -79,7 +79,13 @@ class BLTouchProbe:
     def get_offsets(self):
         return self.probe_offsets.get_offsets()
     def get_status(self, eventtime):
-        return self.cmd_helper.get_status(eventtime)
+        status = {}
+        status.update(self.cmd_helper.get_status(eventtime))
+        x_offset, y_offset, z_offset = self.get_offsets()
+        status.update({
+            'offsets': {'x': x_offset, 'y': y_offset, 'z': z_offset}
+        })
+        return status
     def start_probe_session(self, gcmd):
         return self.probe_session.start_probe_session(gcmd)
     def handle_connect(self):

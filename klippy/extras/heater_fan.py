@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from . import fan
+import logging
 
 PIN_MIN_TIME = 0.100
 
@@ -18,6 +19,13 @@ class PrinterHeaterFan:
         self.fan = fan.Fan(config, default_shutdown_speed=1.)
         self.fan_speed = config.getfloat("fan_speed", 1., minval=0., maxval=1.)
         self.last_speed = 0.
+        # check fan rpm
+        self.check_num = 0
+        self.check_count = config.getint("check_count", 5, minval=1, maxval=600)
+        self.gcode = self.printer.lookup_object('gcode')
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        self.tachometer_zero_gcode = gcode_macro.load_template(
+            config, 'tachometer_zero_gcode', '')
     def handle_ready(self):
         pheaters = self.printer.lookup_object('heaters')
         self.heaters = [pheaters.lookup_heater(n) for n in self.heater_names]
@@ -36,6 +44,18 @@ class PrinterHeaterFan:
             curtime = self.printer.get_reactor().monotonic()
             print_time = self.fan.get_mcu().estimated_print_time(curtime)
             self.fan.set_speed(print_time + PIN_MIN_TIME, speed)
+        # get fan rpm
+        rpm_status = self.fan.get_status(eventtime)['rpm']
+        if rpm_status is not None:
+            if self.check_num == self.check_count:
+                self.gcode.run_script(self.tachometer_zero_gcode.render())
+                logging.info("tachometer zeroed run: %s" %
+                                (self.tachometer_zero_gcode.render(),))
+            if speed > 0. and int(rpm_status) == 0:
+                if self.check_num <= 600:
+                    self.check_num += 1
+            else:
+                self.check_num = 0
         return eventtime + 1.
 
 def load_config_prefix(config):

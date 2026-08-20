@@ -164,6 +164,17 @@ class InputShaper:
             self._update_input_shaping()
         for shaper in self.shapers:
             shaper.report(gcmd)
+    def get_status(self, eventtime):
+        res = {}
+        for shaper in self.shapers:
+            name = shaper.get_name()
+            params = shaper.params
+            res.update({name: {
+                'type': params.shaper_type,
+                'freq': "%0.2f" % (params.shaper_freq,),
+                'damp': "%0.6f" % (params.damping_ratio,),
+            }})
+        return res
 
 def load_config(config):
     return InputShaper(config)

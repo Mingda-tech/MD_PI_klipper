@@ -21,7 +21,7 @@ from mcu import MCU, MCU_trsync
 from clocksync import SecondarySync
 
 STREAM_BUFFER_LIMIT_DEFAULT = 100
-STREAM_TIMEOUT = 2.0
+STREAM_TIMEOUT = 5.0
 probe_object_name = "probe"
 
 class MD_Dist_Probe:
@@ -227,6 +227,7 @@ class MD_Dist_Probe:
                     " addr=%s soft_i2c=%s"
                     % (dout_pin, sclk_pin, temp_pin, self.addr, soft_i2c,))
             elif (self.version_int == 200) or (self.version_int == 300):
+                # get pin
                 temp_pin_name = config.get('temp_pin', None)
                 if temp_pin_name is not None:
                     temp_ppin = ppins.lookup_pin(temp_pin_name)
@@ -248,6 +249,28 @@ class MD_Dist_Probe:
                     mcu.add_config_cmd(
                         "md_dist_temp_config temp_pin=%s" % (temp_pin,))
                     logging.info("md_dist has temp_pin=%s" % (temp_pin,))
+
+                # get config data
+                external_clock = config.getint('external_clock', 0)
+                clock_div = config.getint(
+                    'clock_div', 1, minval=1, maxval=1023)
+                rcount_clock = config.getint(
+                    'rcount_clock', 128, minval=128, maxval=65535)
+                settle_clock = config.getint(
+                    'settle_clock', 2, minval=2, maxval=65535)
+                drive_current = config.getint(
+                    'drive_current', 1, minval=1, maxval=31)
+                logging.info(
+                    "md_dist_config_data external_clock=%s clock_div=%s"
+                    " rcount=%s settle=%s current=%s"
+                    % (external_clock, clock_div,
+                       rcount_clock, settle_clock, drive_current,))
+                mcu.add_config_cmd(
+                    "md_dist_config_data external_clock=%s clock_div=%s"
+                    " rcount=%s settle=%s current=%s"
+                    % (external_clock, clock_div,
+                       rcount_clock, settle_clock, drive_current,))
+
                 logging.info(
                     "md_dist_config dout_pin=%s sclk_pin=%s addr=%s"
                     " soft_i2c=%s"
@@ -1097,7 +1120,7 @@ class MD_Dist_Probe:
 
         # logging.info("md_dist: data=%s temp=%s" %
         # self.gcode.respond_info("md_dist: data=%s temp=%s" %
-        #        (params["data"], params["temp"],))
+            #    (params["data"], params["temp"],))
 
         self._stream_buffer.append(params.copy())
         self._stream_flush_schedule()

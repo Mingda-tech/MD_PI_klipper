@@ -290,6 +290,8 @@ class ResonanceTester:
         name_suffix = gcmd.get("NAME", time.strftime("%Y%m%d_%H%M%S"))
         if not self.is_valid_name_suffix(name_suffix):
             raise gcmd.error("Invalid NAME parameter")
+        
+        save_flag = gcmd.get_int("SAVE", 1)
 
         input_shaper = self.printer.lookup_object('input_shaper', None)
 
@@ -321,16 +323,19 @@ class ResonanceTester:
             if input_shaper is not None:
                 helper.apply_params(input_shaper, axis_name,
                                     best_shaper.name, best_shaper.freq)
-            helper.save_params(configfile, axis_name,
-                               best_shaper.name, best_shaper.freq)
-            csv_name = self.save_calibration_data(
-                    'calibration_data', name_suffix, helper, axis,
-                    calibration_data[axis], all_shapers, max_freq=max_freq)
+            if save_flag:
+                helper.save_params(configfile, axis_name,
+                                best_shaper.name, best_shaper.freq)
+                csv_name = self.save_calibration_data(
+                        'calibration_data', name_suffix, helper, axis,
+                        calibration_data[axis], all_shapers, max_freq=max_freq)
+                gcmd.respond_info(
+                        "Shaper calibration data written to %s file" %
+                        (csv_name,))
+        if save_flag:
             gcmd.respond_info(
-                    "Shaper calibration data written to %s file" % (csv_name,))
-        gcmd.respond_info(
-            "The SAVE_CONFIG command will update the printer config file\n"
-            "with these parameters and restart the printer.")
+                "The SAVE_CONFIG command will update the printer config file\n"
+                "with these parameters and restart the printer.")
     cmd_MEASURE_AXES_NOISE_help = (
         "Measures noise of all enabled accelerometer chips")
     def cmd_MEASURE_AXES_NOISE(self, gcmd):

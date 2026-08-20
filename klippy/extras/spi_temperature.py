@@ -34,6 +34,13 @@ class SensorBase:
         mcu.register_response(self._handle_spi_response,
                               "thermocouple_result", oid)
         mcu.register_config_callback(self._build_config)
+        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+        self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        self.ready_flag = False
+    def _handle_ready(self):
+        self.ready_flag = True
+    def _handle_shutdown(self):
+        self.ready_flag = False
     def setup_minmax(self, min_temp, max_temp):
         if self.sensor_min_temp is not None:
             min_temp = min(min_temp, self.sensor_min_temp)
@@ -66,6 +73,8 @@ class SensorBase:
         next_clock      = self.mcu.clock32_to_clock64(params['next_clock'])
         last_read_clock = next_clock - self._report_clock
         last_read_time  = self.mcu.clock_to_print_time(last_read_clock)
+        if not self.ready_flag:
+            return
         self._callback(last_read_time, temp)
     def report_fault(self, msg):
         logging.warning(msg)

@@ -77,8 +77,14 @@ class PrinterOutputPin:
             self.mcu_pin = ppins.setup_pin('pwm', config.get('pin'))
             cycle_time = config.getfloat('cycle_time', 0.100, above=0.,
                                          maxval=MAX_SCHEDULE_TIME)
+            pre_value = config.getint('pre', None)
+            arr_value = config.getint('arr', None)
             hardware_pwm = config.getboolean('hardware_pwm', False)
-            self.mcu_pin.setup_cycle_time(cycle_time, hardware_pwm)
+            if ((pre_value is not None) and (arr_value is not None)
+                 and (hardware_pwm)):
+                self.mcu_pin.setup_pre_arr(pre_value, arr_value)
+            else:
+                self.mcu_pin.setup_cycle_time(cycle_time, hardware_pwm)
             self.scale = config.getfloat('scale', 1., above=0.)
         else:
             self.mcu_pin = ppins.setup_pin('digital_out', config.get('pin'))

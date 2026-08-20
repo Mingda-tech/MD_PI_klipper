@@ -409,13 +409,20 @@ class MCU_pwm:
         self._last_clock = 0
         self._pwm_max = 0.
         self._set_cmd = None
+        self._use_pre_arr = False
+        self._pre = self._arr = 1
     def get_mcu(self):
         return self._mcu
     def setup_max_duration(self, max_duration):
         self._max_duration = max_duration
     def setup_cycle_time(self, cycle_time, hardware_pwm=False):
+        self._use_pre_arr = False
         self._cycle_time = cycle_time
         self._hardware_pwm = hardware_pwm
+    def setup_pre_arr(self, pre, arr):
+        self._use_pre_arr = True
+        self._pre, self._arr = pre, arr
+        self._hardware_pwm = True
     def setup_start_value(self, start_value, shutdown_value):
         if self._invert:
             start_value = 1. - start_value
@@ -438,12 +445,21 @@ class MCU_pwm:
             self._pwm_max = self._mcu.get_constant_float("PWM_MAX")
             self._mcu.request_move_queue_slot()
             self._oid = self._mcu.create_oid()
-            self._mcu.add_config_cmd(
-                "config_pwm_out oid=%d pin=%s cycle_ticks=%d value=%d"
-                " default_value=%d max_duration=%d"
-                % (self._oid, self._pin, cycle_ticks,
-                   self._start_value * self._pwm_max,
-                   self._shutdown_value * self._pwm_max, mdur_ticks))
+            if self._use_pre_arr:
+                self._pwm_max = self._arr
+                self._mcu.add_config_cmd(
+                    "config_pwm_out_pa oid=%d pin=%s pre=%d arr=%d value=%d"
+                    " default_value=%d max_duration=%d"
+                    % (self._oid, self._pin, self._pre, self._arr,
+                       self._start_value * self._pwm_max,
+                       self._shutdown_value * self._pwm_max, mdur_ticks))
+            else:
+                self._mcu.add_config_cmd(
+                    "config_pwm_out oid=%d pin=%s cycle_ticks=%d value=%d"
+                    " default_value=%d max_duration=%d"
+                    % (self._oid, self._pin, cycle_ticks,
+                    self._start_value * self._pwm_max,
+                    self._shutdown_value * self._pwm_max, mdur_ticks))
             svalue = int(self._start_value * self._pwm_max + 0.5)
             self._mcu.add_config_cmd("queue_pwm_out oid=%d clock=%d value=%d"
                                      % (self._oid, self._last_clock, svalue),

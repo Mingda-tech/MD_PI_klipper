@@ -22,6 +22,12 @@ class LEDHelper:
         blue = config.getfloat('initial_BLUE', 0., minval=0., maxval=1.)
         white = config.getfloat('initial_WHITE', 0., minval=0., maxval=1.)
         self.led_state = [(red, green, blue, white)] * led_count
+        # shutdown color
+        s_red = config.getint('shutdown_RED', 0, minval=0, maxval=1)
+        s_green = config.getint('shutdown_GREEN', 0, minval=0, maxval=1)
+        s_blue = config.getint('shutdown_BLUE', 0, minval=0, maxval=1)
+        s_white = config.getint('shutdown_WHITE', 0, minval=0, maxval=1)
+        self.s_led_state = [(s_red, s_green, s_blue, s_white)] * led_count
         # Register commands
         name = config.get_name().split()[-1]
         gcode = self.printer.lookup_object('gcode')
@@ -73,7 +79,8 @@ class LEDHelper:
             #Send update now (so as not to wake toolhead and reset idle_timeout)
             lookahead_bgfunc(None)
     def get_status(self, eventtime=None):
-        return {'color_data': self.led_state}
+        return {'color_data': self.led_state,
+                'shutdown_color_data': self.s_led_state}
 
 # Main LED tracking code
 class PrinterLED:
@@ -207,9 +214,11 @@ class PrinterPWMLED:
         # Initialize color data
         pled = printer.load_object(config, "led")
         self.led_helper = pled.setup_helper(config, self.update_leds, 1)
-        self.prev_color = color = self.led_helper.get_status()['color_data'][0]
+        led_status = self.led_helper.get_status()
+        self.prev_color = color = led_status['color_data'][0]
+        shutdown_color = led_status['shutdown_color_data'][0]
         for idx, mcu_pin in self.pins:
-            mcu_pin.setup_start_value(color[idx], 0.)
+            mcu_pin.setup_start_value(color[idx], shutdown_color[idx])
     def update_leds(self, led_state, print_time):
         if print_time is None:
             eventtime = self.printer.get_reactor().monotonic()

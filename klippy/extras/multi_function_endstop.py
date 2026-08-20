@@ -464,7 +464,7 @@ class MultiFunctionEndstop:
                 # 回缩
                 if (self.sample_retract_dist > 0.000001):
                     retract_pos[axis_to_num] = (
-                        epos[axis_to_num] + self.retract_len)
+                        epos[axis_to_num] + retract_len)
                     self._move(retract_pos, self.move_speed)
                 # 计算下一次触摸终结位置
                 touch_pos[axis_to_num] = (epos[axis_to_num] + extend_len)
