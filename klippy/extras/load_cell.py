@@ -382,6 +382,39 @@ class LoadCellSampleCollector:
 
 # Printer class that controls the load cell
 MIN_COUNTS_PER_GRAM = 1.
+
+def _load_legacy_probe_options(config):
+    # These options controlled the probe recovery implementation used before
+    # the versioned home trigger protocol was introduced.  Keep consuming
+    # them so that existing printer configs continue to load after an update.
+    # They are deprecated and intentionally do not alter the new probe flow.
+    legacy_options = {}
+    config_options = set(config.get_prefix_options(''))
+    if 'reuse_probe_thresholds' in config_options:
+        legacy_options['reuse_probe_thresholds'] = config.getboolean(
+            'reuse_probe_thresholds')
+    if 'no_trigger_retries' in config_options:
+        legacy_options['no_trigger_retries'] = config.getint(
+            'no_trigger_retries', minval=0, maxval=5)
+    if 'no_trigger_retract_dist' in config_options:
+        legacy_options['no_trigger_retract_dist'] = config.getfloat(
+            'no_trigger_retract_dist', above=0.)
+    if 'minimum_probe_travel' in config_options:
+        legacy_options['minimum_probe_travel'] = config.getfloat(
+            'minimum_probe_travel', minval=0.)
+    if 'no_trigger_retract_speed' in config_options:
+        legacy_options['no_trigger_retract_speed'] = config.getfloat(
+            'no_trigger_retract_speed', above=0.)
+    if 'force_sample_timeout' in config_options:
+        legacy_options['force_sample_timeout'] = config.getfloat(
+            'force_sample_timeout', above=0.)
+    if 'max_trigger_overshoot' in config_options:
+        legacy_options['max_trigger_overshoot'] = config.getint(
+            'max_trigger_overshoot', minval=0)
+    for option in legacy_options:
+        config.deprecate(option)
+    return legacy_options
+
 class LoadCell:
     def __init__(self, config, sensor):
         self.printer = printer = config.get_printer()
@@ -647,6 +680,7 @@ class LoadCellEndstop:
         self.press_deformation_offset = config.getfloat(
             'press_deformation_offset', minval=0.
         )
+        self._legacy_probe_options = _load_legacy_probe_options(config)
         # self._printer.register_event_handler(
         #     "homing:home_rails_begin",
         #     self._handle_home_rails_begin
