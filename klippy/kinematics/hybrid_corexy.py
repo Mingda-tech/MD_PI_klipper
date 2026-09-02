@@ -110,8 +110,10 @@ class HybridCoreXYKinematics:
                 self.dc_module.home(homing_state)
             else:
                 self.home_axis(homing_state, axis, self.rails[axis])
-    def _motor_off(self, print_time):
-        self.limits = [(1.0, -1.0)] * 3
+    def _motor_off(self, print_time, homing_axes=(0, 1, 2)):
+        for i, rail in enumerate(self.rails):
+            if i in homing_axes:
+                self.limits[i] = (1.0, -1.0)
     def _check_endstops(self, move):
         end_pos = move.end_pos
         for i in (0, 1, 2):
