@@ -253,13 +253,13 @@ class MD_Dist_Probe:
                 # get config data
                 external_clock = config.getint('external_clock', 0)
                 clock_div = config.getint(
-                    'clock_div', 1, minval=1, maxval=1023)
+                    'clock_div', 2, minval=1, maxval=1023)
                 rcount_clock = config.getint(
-                    'rcount_clock', 128, minval=128, maxval=65535)
+                    'rcount_clock', 500, minval=128, maxval=65535)
                 settle_clock = config.getint(
-                    'settle_clock', 2, minval=2, maxval=65535)
+                    'settle_clock', 62, minval=2, maxval=65535)
                 drive_current = config.getint(
-                    'drive_current', 1, minval=1, maxval=31)
+                    'drive_current', 31, minval=1, maxval=31)
                 logging.info(
                     "md_dist_config_data external_clock=%s clock_div=%s"
                     " rcount=%s settle=%s current=%s"
