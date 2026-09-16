@@ -592,6 +592,8 @@ class MCU:
         if self._baud:
             self._restart_method = config.getchoice('restart_method',
                                                     restart_methods, None)
+        self.retry_count = config.getint('retry_count', 10, minval=1)
+        self.retry_interval = config.getfloat('retry_interval', 0.5, minval=0.0)
         self._reset_cmd = self._config_reset_cmd = None
         self._is_mcu_bridge = False
         self._emergency_stop_cmd = None
@@ -734,15 +736,7 @@ class MCU:
         get_config_cmd = self.lookup_query_command(
             "get_config",
             "config is_config=%c crc=%u is_shutdown=%c move_count=%hu")
-        if self.is_fileoutput():
-            return { 'is_config': 0, 'move_count': 500, 'crc': 0 }
         config_params = get_config_cmd.send()
-        if self._is_shutdown:
-            raise error("MCU '%s' error during config: %s" % (
-                self._name, self._shutdown_msg))
-        if config_params['is_shutdown']:
-            raise error("Can not update MCU '%s' config as it is shutdown" % (
-                self._name,))
         return config_params
     def _log_info(self):
         msgparser = self._serial.get_msgparser()
@@ -755,25 +749,44 @@ class MCU:
                 ["%s=%s" % (k, v) for k, v in self.get_constants().items()]))]
         return "\n".join(log_info)
     def _connect(self):
-        config_params = self._send_get_config()
-        if not config_params['is_config']:
-            if self._restart_method == 'rpi_usb':
-                # Only configure mcu after usb power reset
-                self._check_restart("full reset before config")
-            # Not configured - send config and issue get_config again
-            self._send_config(None)
-            config_params = self._send_get_config()
-            if not config_params['is_config'] and not self.is_fileoutput():
-                raise error("Unable to configure MCU '%s'" % (self._name,))
+        if self.is_fileoutput():
+            move_count = 500
         else:
-            start_reason = self._printer.get_start_args().get("start_reason")
-            if start_reason == 'firmware_restart':
-                raise error("Failed automated reset of MCU '%s'"
-                            % (self._name,))
-            # Already configured - send init commands
-            self._send_config(config_params['crc'])
-        # Setup steppersync with the move_count returned by get_config
-        move_count = config_params['move_count']
+            config_params = self._send_get_config()
+            if self._is_shutdown:
+                raise error("MCU '%s' error during config: %s" % (
+                    self._name, self._shutdown_msg))
+            elif not config_params['is_config'] or config_params['is_shutdown']:
+                for i in range(self.retry_count):
+                    logging.info("mcu _config _send_get_config %s" %
+                                 config_params)
+                    if self._restart_method == 'rpi_usb':
+                        # Only configure mcu after usb power reset
+                        self._check_restart("full reset before config")
+                    # Not configured - send config and issue get_config again
+                    self._send_config(None)
+                    config_params = self._send_get_config()
+                    if (config_params['is_config'] and 
+                        (not config_params['is_shutdown'])):
+                        break
+                    if self.retry_interval > 0.000001:
+                        self._reactor.pause(self._reactor.monotonic() +
+                                            self.retry_interval)
+                if config_params['is_shutdown']:
+                    raise error("Can not update MCU '%s' config as"
+                                " it is shutdown" % (self._name,))
+                elif not config_params['is_config']:
+                    raise error("Unable to configure MCU '%s'" % (self._name,))
+            else:
+                start_reason = self._printer.get_start_args().get("start_reason")
+                if start_reason == 'firmware_restart':
+                    raise error("Failed automated reset of MCU '%s'"
+                                % (self._name,))
+                # Already configured - send init commands
+                self._send_config(config_params['crc'])
+            # Setup steppersync with the move_count returned by get_config
+            move_count = config_params['move_count']
+
         if move_count < self._reserved_move_slots:
             raise error("Too few moves available on MCU '%s'" % (self._name,))
         ffi_main, ffi_lib = chelper.get_ffi()

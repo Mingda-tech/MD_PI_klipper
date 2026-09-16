@@ -387,6 +387,7 @@ class VirtualSD:
             return
 
         config = configparser.ConfigParser()
+        config.optionxform = str  # 保留键名大小写
 
         # 基本打印状态
         config['print_state'] = {
@@ -551,6 +552,7 @@ class VirtualSD:
 
         # 读取状态文件
         config = configparser.ConfigParser()
+        config.optionxform = str  # 保留键名大小写
         state_file = None
         state_data = None
 
