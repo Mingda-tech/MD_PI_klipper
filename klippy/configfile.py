@@ -431,5 +431,5 @@ class PrinterConfig:
             msg = "Unable to write config file during SAVE_CONFIG"
             logging.exception(msg)
             raise gcode.error(msg)
-        # Request a restart
-        gcode.request_restart('restart')
+        # Reset MCUs before reconnecting with the saved configuration
+        gcode.request_restart('firmware_restart')
